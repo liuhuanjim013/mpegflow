@@ -22,11 +22,13 @@ using namespace std;
 AVFrame* ffmpeg_pFrame;
 AVFormatContext* ffmpeg_pFormatCtx;
 AVStream* ffmpeg_pVideoStream;
+AVCodecContext* ffmpeg_pCodecCtx;
 int ffmpeg_videoStreamIndex;
 size_t ffmpeg_frameWidth, ffmpeg_frameHeight;
 
 bool ARG_OUTPUT_RAW_MOTION_VECTORS, ARG_FORCE_GRID_8, ARG_FORCE_GRID_16, ARG_OUTPUT_OCCUPANCY, ARG_QUIET, ARG_HELP;
 const char* ARG_VIDEO_PATH;
+static int video_frame_count = 0;
 
 void ffmpeg_print_error(int err) // copied from cmdutils.c, originally called print_error
 {
@@ -44,12 +46,14 @@ void ffmpeg_log_callback_null(void *ptr, int level, const char *fmt, va_list vl)
 
 void ffmpeg_init()
 {
-	av_register_all();
+	avformat_network_init();
 
 	if(ARG_QUIET)
 	{
 		av_log_set_level(AV_LOG_ERROR);
 		av_log_set_callback(ffmpeg_log_callback_null);
+	} else {
+		av_log_set_level(AV_LOG_DEBUG);
 	}
 
 	ffmpeg_pFrame = av_frame_alloc();
@@ -69,104 +73,46 @@ void ffmpeg_init()
 		ffmpeg_print_error(err);
 		throw std::runtime_error("Stream information not found.");
 	}
-
-	for(int i = 0; i < ffmpeg_pFormatCtx->nb_streams; i++)
-	{
-		AVCodecContext *enc = ffmpeg_pFormatCtx->streams[i]->codec;
-		if( AVMEDIA_TYPE_VIDEO == enc->codec_type && ffmpeg_videoStreamIndex < 0 )
-		{
-			AVCodec *pCodec = avcodec_find_decoder(enc->codec_id);
-			AVDictionary *opts = NULL;
-			av_dict_set(&opts, "flags2", "+export_mvs", 0);
-			if (!pCodec || avcodec_open2(enc, pCodec, &opts) < 0)
-				throw std::runtime_error("Codec not found or cannot open codec.");
-
-			ffmpeg_videoStreamIndex = i;
-			ffmpeg_pVideoStream = ffmpeg_pFormatCtx->streams[i];
-			ffmpeg_frameWidth = enc->width;
-			ffmpeg_frameHeight = enc->height;
-
-			break;
-		}
+	const AVCodec *dec = NULL;
+	enum AVMediaType type = AVMEDIA_TYPE_VIDEO;
+	int ret = av_find_best_stream(ffmpeg_pFormatCtx, type, -1, -1, &dec, 0);
+	if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Could not find %s stream in input file '%s'\n",
+                av_get_media_type_string(type), ARG_VIDEO_PATH);
+		throw std::runtime_error("Could not find video stream in input file.");
 	}
 
-	if(ffmpeg_videoStreamIndex == -1)
-		throw std::runtime_error("Video stream not found.");
-}
+	int stream_idx = ret;
+	AVStream *st;
+	st = ffmpeg_pFormatCtx->streams[stream_idx];
 
-bool process_frame(AVPacket *pkt)
-{
-	av_frame_unref(ffmpeg_pFrame);
-
-	int got_frame = 0;
-	int ret = avcodec_decode_video2(ffmpeg_pVideoStream->codec, ffmpeg_pFrame, &got_frame, pkt);
-	if (ret < 0)
-		return false;
-
-	ret = FFMIN(ret, pkt->size); /* guard against bogus return values */
-	pkt->data += ret;
-	pkt->size -= ret;
-	return got_frame > 0;
-}
-
-bool read_packets()
-{
-	static bool initialized = false;
-	static AVPacket pkt, pktCopy;
-
-	while(true)
-	{
-		if(initialized)
-		{
-			if(process_frame(&pktCopy))
-				return true;
-			else
-			{
-				av_packet_unref(&pkt);
-				initialized = false;
-			}
-		}
-
-		int ret = av_read_frame(ffmpeg_pFormatCtx, &pkt);
-		if(ret != 0)
-			break;
-
-		initialized = true;
-		pktCopy = pkt;
-		if(pkt.stream_index != ffmpeg_videoStreamIndex)
-		{
-			av_packet_unref(&pkt);
-			initialized = false;
-			continue;
-		}
+	ffmpeg_pCodecCtx = avcodec_alloc_context3(dec);
+	if (!ffmpeg_pCodecCtx) {
+		av_log(NULL, AV_LOG_ERROR, "Failed to allocate codec context %d\n",AVERROR(EINVAL));
+		throw std::runtime_error("Failed to allocate codec context.");
 	}
 
-	return process_frame(&pkt);
-}
-
-bool read_frame(int64_t& pts, char& pictType, vector<AVMotionVector>& motion_vectors)
-{
-	if(!read_packets())
-		return false;
-	
-	pictType = av_get_picture_type_char(ffmpeg_pFrame->pict_type);
-	// fragile, consult fresh f_select.c and ffprobe.c when updating ffmpeg
-	pts = ffmpeg_pFrame->pkt_pts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pkt_pts : (ffmpeg_pFrame->pkt_dts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pkt_dts : pts + 1);
-	bool noMotionVectors = av_frame_get_side_data(ffmpeg_pFrame, AV_FRAME_DATA_MOTION_VECTORS) == NULL;
-	if(!noMotionVectors)
-	{
-		// reading motion vectors, see ff_print_debug_info2 in ffmpeg's libavcodec/mpegvideo.c for reference and a fresh doc/examples/extract_mvs.c
-		AVFrameSideData* sd = av_frame_get_side_data(ffmpeg_pFrame, AV_FRAME_DATA_MOTION_VECTORS);
-		AVMotionVector* mvs = (AVMotionVector*)sd->data;
-		int mvcount = sd->size / sizeof(AVMotionVector);
-		motion_vectors = vector<AVMotionVector>(mvs, mvs + mvcount);
-	}
-	else
-	{
-		motion_vectors = vector<AVMotionVector>();
+	ret = avcodec_parameters_to_context(ffmpeg_pCodecCtx, st->codecpar);
+	if (ret < 0) {
+		av_log(NULL, AV_LOG_ERROR, "Failed to copy codec parameters to codec context %d\n",ret);
+		throw std::runtime_error("Failed to copy codec parameters to codec context.");
 	}
 
-	return true;
+	AVDictionary *opts = NULL;
+	av_dict_set(&opts, "flags2", "+export_mvs", 0);
+	ret = avcodec_open2(ffmpeg_pCodecCtx, dec, &opts);
+	av_dict_free(&opts);
+	if (ret < 0) {
+		av_log(NULL, AV_LOG_ERROR, "Failed to open %s codec\n",
+				av_get_media_type_string(type));
+		throw std::runtime_error("Failed to open codec.");
+	}
+
+	ffmpeg_videoStreamIndex = stream_idx;
+	ffmpeg_pVideoStream = ffmpeg_pFormatCtx->streams[ffmpeg_videoStreamIndex];
+	ffmpeg_frameWidth = ffmpeg_pCodecCtx->width;
+	ffmpeg_frameHeight = ffmpeg_pCodecCtx->height;
+	av_log(NULL, AV_LOG_ERROR, "Video stream found at index %d\n", ffmpeg_videoStreamIndex);
 }
 
 struct FrameInfo
@@ -400,27 +346,66 @@ int main(int argc, const char* argv[])
 {
 	parse_options(argc, argv);
 	ffmpeg_init();
-		
+	av_log(NULL, AV_LOG_DEBUG, "1 Reading frame\n");
+	AVPacket pkt;
 	int64_t pts, prev_pts = -1;
 	char pictType;
 	vector<AVMotionVector> motionVectors;
+	while (av_read_frame(ffmpeg_pFormatCtx, &pkt) >= 0) {
+		av_log(NULL, AV_LOG_DEBUG, "2 got packet\n");
+        if (pkt.stream_index == ffmpeg_videoStreamIndex) {
+			int ret = avcodec_send_packet(ffmpeg_pCodecCtx, &pkt);
+			if (ret < 0) {
+				av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder: %s\n", av_err2str(ret));
+				return -1;
+			}
 
-	for(int frameIndex = 1; read_frame(pts, pictType, motionVectors); frameIndex++)
-	{
-		if(pts <= prev_pts && prev_pts != -1)
-		{
-			if(!ARG_QUIET)
-				fprintf(stderr, "Skipping frame %d (frame with pts %d already processed).\n", int(frameIndex), int(pts));
-			continue;
+			while (ret >= 0)  {
+				ret = avcodec_receive_frame(ffmpeg_pCodecCtx, ffmpeg_pFrame);
+				if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+					break;
+				} else if (ret < 0) {
+					av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder: %s\n", av_err2str(ret));
+					return -1;
+				}
+
+				if (ret >= 0) {
+					video_frame_count++;
+					pictType = av_get_picture_type_char(ffmpeg_pFrame->pict_type);
+					// fragile, consult fresh f_select.c and ffprobe.c when updating ffmpeg
+					pts = ffmpeg_pFrame->pts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pts : (ffmpeg_pFrame->pkt_dts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pkt_dts : pts + 1);
+					av_log(NULL, AV_LOG_DEBUG, "Frame pts=%lld pict_type=%c\n", (long long) pts, pictType);
+					AVFrameSideData *sd;
+					sd = av_frame_get_side_data(ffmpeg_pFrame, AV_FRAME_DATA_MOTION_VECTORS);
+					if (sd) {
+						const AVMotionVector *mvs = (const AVMotionVector *)sd->data;
+						int mvcount = sd->size / sizeof(AVMotionVector);
+						motionVectors = vector<AVMotionVector>(mvs, mvs + mvcount);
+						av_log(NULL, AV_LOG_DEBUG, "Frame has motion %d vectors\n", mvcount);
+					} else {
+						av_log(NULL, AV_LOG_DEBUG, "Frame has no motion vectors\n");
+					}
+					if(pts <= prev_pts && prev_pts != -1)
+					{
+						if(!ARG_QUIET)
+							av_log(NULL, AV_LOG_ERROR, "Skipping frame %d (frame with pts %d already processed).\n", int(video_frame_count), int(pts));
+						continue;
+					}
+
+					if(ARG_OUTPUT_RAW_MOTION_VECTORS)
+						output_vectors_raw(video_frame_count, pts, pictType, motionVectors);
+					else
+						output_vectors_std(video_frame_count, pts, pictType, motionVectors);
+
+					prev_pts = pts;
+
+				}
+				av_frame_unref(ffmpeg_pFrame);
+			}
 		}
-
-		if(ARG_OUTPUT_RAW_MOTION_VECTORS)
-			output_vectors_raw(frameIndex, pts, pictType, motionVectors);
-		else
-			output_vectors_std(frameIndex, pts, pictType, motionVectors);
-
-		prev_pts = pts;
-	}
-	if(ARG_OUTPUT_RAW_MOTION_VECTORS == false)
+    }
+	av_packet_unref(&pkt);
+if(ARG_OUTPUT_RAW_MOTION_VECTORS == false)
 		output_vectors_std(-1, pts, pictType, motionVectors);
+		
 }
