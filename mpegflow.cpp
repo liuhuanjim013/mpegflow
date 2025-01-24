@@ -112,7 +112,6 @@ void ffmpeg_init()
 	ffmpeg_pVideoStream = ffmpeg_pFormatCtx->streams[ffmpeg_videoStreamIndex];
 	ffmpeg_frameWidth = ffmpeg_pCodecCtx->width;
 	ffmpeg_frameHeight = ffmpeg_pCodecCtx->height;
-	av_log(NULL, AV_LOG_ERROR, "Video stream found at index %d\n", ffmpeg_videoStreamIndex);
 }
 
 struct FrameInfo
@@ -253,8 +252,9 @@ void output_vectors_std(int frameIndex, int64_t pts, char pictType, vector<AVMot
 	size_t gridStep = ARG_FORCE_GRID_8 ? 8 : 16;
 	pair<size_t, size_t> shape = make_pair(min(ffmpeg_frameHeight / gridStep, FrameInfo::MAX_GRID_SIZE), min(ffmpeg_frameWidth / gridStep, FrameInfo::MAX_GRID_SIZE));
 
-	if(!prev.empty() && pts != prev.back().Pts + 1)
+	if(!prev.empty() && pts < prev.back().Pts + 1)
 	{
+		av_log(NULL, AV_LOG_ERROR, "Missing frame(s) between prev.back().Pts=%lld and pts=%lld\n", (long long) prev.back().Pts, (long long) pts);
 		for(int64_t dummy_pts = prev.back().Pts + 1; dummy_pts < pts; dummy_pts++)
 		{
 			FrameInfo dummy;
@@ -266,6 +266,8 @@ void output_vectors_std(int frameIndex, int64_t pts, char pictType, vector<AVMot
 			dummy.Shape = shape;
 			prev.push_back(dummy);
 		}
+	} else if (!prev.empty()) {
+		av_log(NULL, AV_LOG_DEBUG, "prev.empty()=%d pts=%lld prev.back().Pts=%lld\n", prev.empty(), (long long) pts, (long long) prev.back().Pts);
 	}
 
 	FrameInfo cur;
@@ -373,7 +375,19 @@ int main(int argc, const char* argv[])
 					video_frame_count++;
 					pictType = av_get_picture_type_char(ffmpeg_pFrame->pict_type);
 					// fragile, consult fresh f_select.c and ffprobe.c when updating ffmpeg
-					pts = ffmpeg_pFrame->pts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pts : (ffmpeg_pFrame->pkt_dts != AV_NOPTS_VALUE ? ffmpeg_pFrame->pkt_dts : pts + 1);
+					av_log(NULL, AV_LOG_DEBUG, "ffmpeg_pFrame->pts=%lld ffmpeg_pFrame->pkt_dts=%lld pts=%lld\n", (long long) ffmpeg_pFrame->pts, (long long) ffmpeg_pFrame->pkt_dts, (long long) pts);
+					if (ffmpeg_pFrame->pts != AV_NOPTS_VALUE) {
+						pts = ffmpeg_pFrame->pts; // Use PTS if it is valid
+					} else if (ffmpeg_pFrame->pkt_dts != AV_NOPTS_VALUE) {
+							if (ffmpeg_pFrame->pkt_dts != AV_NOPTS_VALUE) { // Handle the case where PTS is not defined
+								pts = ffmpeg_pFrame->pkt_dts; // Use DTS if PTS is not available
+							} else { // Fallback to incrementing the last known PTS
+								pts = pts + 1;
+							}
+					} else {
+						pts = pts + 1; // Increment the last known PTS if both are invalid
+					}
+
 					av_log(NULL, AV_LOG_DEBUG, "Frame pts=%lld pict_type=%c\n", (long long) pts, pictType);
 					AVFrameSideData *sd;
 					sd = av_frame_get_side_data(ffmpeg_pFrame, AV_FRAME_DATA_MOTION_VECTORS);
@@ -392,6 +406,7 @@ int main(int argc, const char* argv[])
 						continue;
 					}
 
+					av_log(NULL, AV_LOG_DEBUG, "3 outputting vectors video_frame_count=%d pts=%lld pict_type=%c\n", video_frame_count, (long long) pts, pictType);
 					if(ARG_OUTPUT_RAW_MOTION_VECTORS)
 						output_vectors_raw(video_frame_count, pts, pictType, motionVectors);
 					else
