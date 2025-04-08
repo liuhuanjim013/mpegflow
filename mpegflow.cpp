@@ -1,7 +1,10 @@
 #include <cstdio>
 #include <cassert>
 #include <cstdlib>
-#include <ctime>
+#define __STDC_WANT_LIB_EXT1__ 1  // Request C11 safe functions
+extern "C" {
+#include <time.h>  // Use only the C version
+}
 #include <stdint.h>
 
 extern "C"
@@ -29,6 +32,13 @@ size_t ffmpeg_frameWidth, ffmpeg_frameHeight;
 bool ARG_OUTPUT_RAW_MOTION_VECTORS, ARG_FORCE_GRID_8, ARG_FORCE_GRID_16, ARG_OUTPUT_OCCUPANCY, ARG_QUIET, ARG_HELP;
 const char* ARG_VIDEO_PATH;
 static int video_frame_count = 0;
+
+static char* get_error_text(int error)
+{
+	static char error_buffer[255];
+	av_strerror(error, error_buffer, sizeof(error_buffer));
+	return error_buffer;
+}
 
 void ffmpeg_print_error(int err) // copied from cmdutils.c, originally called print_error
 {
@@ -358,7 +368,7 @@ int main(int argc, const char* argv[])
         if (pkt.stream_index == ffmpeg_videoStreamIndex) {
 			int ret = avcodec_send_packet(ffmpeg_pCodecCtx, &pkt);
 			if (ret < 0) {
-				av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder: %s\n", av_err2str(ret));
+				av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder: %s\n", get_error_text(ret));
 				return -1;
 			}
 
@@ -367,7 +377,7 @@ int main(int argc, const char* argv[])
 				if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 					break;
 				} else if (ret < 0) {
-					av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder: %s\n", av_err2str(ret));
+					av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder: %s\n", get_error_text(ret));
 					return -1;
 				}
 
