@@ -38,6 +38,9 @@ target_link_libraries(mpegflow
     c
 )
 
+# Install rule for mpegflow
+install(TARGETS mpegflow DESTINATION bin)
+
 # Optional vis executable
 option(BUILD_VIS "Build the vis executable" OFF)
 
@@ -69,6 +72,9 @@ if(BUILD_VIS)
         z 
         c
     )
+
+    # Install rule for vis
+    install(TARGETS vis DESTINATION bin)
 endif()
 
 # Clean target (not directly supported in CMake, handled by build system)
