@@ -84,9 +84,8 @@ void ffmpeg_init()
 		throw std::runtime_error("Stream information not found.");
 	}
 	const AVCodec *dec = NULL;
-	AVCodec* non_const_dec=const_cast<AVCodec*>(dec);
 	enum AVMediaType type = AVMEDIA_TYPE_VIDEO;
-	int ret = av_find_best_stream(ffmpeg_pFormatCtx, type, -1, -1, &non_const_dec, 0);
+	int ret = av_find_best_stream(ffmpeg_pFormatCtx, type, -1, -1, (const AVCodec **)&dec, 0);
 	if (ret < 0) {
         av_log(NULL, AV_LOG_ERROR, "Could not find %s stream in input file '%s'\n",
                 av_get_media_type_string(type), ARG_VIDEO_PATH);
